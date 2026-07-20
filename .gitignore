@@ -1,0 +1,28 @@
+# Secrets and local sessions
+.env
+*.session
+cookies.txt
+cookies.txt.bak
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# JavaScript
+node_modules/
+
+# Generated data and model caches
+.cache/
+downloads/
+outputs/
+debug_output/
+models/
+*.nemo
+*.zip
+*.log
+
+# Local diagnostic artifacts
+search_results.txt
+recovered_download_conv.md
