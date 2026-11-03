@@ -5,6 +5,7 @@ import torch
 import shutil
 import datetime
 import tempfile
+import inspect
 from omegaconf import OmegaConf
 
 # 1. Environment variables to prevent common Windows multi-threading & Lhotse loader bugs
@@ -98,25 +99,29 @@ def split_audio_ffmpeg(file_path, temp_dir, chunk_length_s=300, overlap_s=10):
 
     print(f"Total audio duration: {duration:.2f} seconds")
     
-    # If the file is shorter than a chunk, just normalize it
-    if duration <= chunk_length_s:
-        output_path = os.path.join(temp_dir, "normalized_full.wav")
-        cmd = [
-            'ffmpeg', '-y',
-            '-i', str(file_path),
-            '-acodec', 'pcm_s16le',
-            '-ar', '16000',
-            '-ac', '1',
-            output_path
-        ]
-        try:
-            subprocess.run(cmd, check=True, capture_output=True)
-            return [output_path]
-        except Exception as e:
-            print(f"[ERROR] Normalization failed: {e}. Proceeding with raw file.")
-            return [str(file_path)]
+    # Step 1: Normalize entire file to 16kHz mono WAV first to ensure sample-accurate seeking
+    normalized_full = os.path.join(temp_dir, "normalized_full.wav")
+    print("Normalizing full audio to 16kHz mono PCM WAV...")
+    cmd_norm = [
+        'ffmpeg', '-y',
+        '-i', str(file_path),
+        '-vn',
+        '-acodec', 'pcm_s16le',
+        '-ar', '16000',
+        '-ac', '1',
+        normalized_full
+    ]
+    try:
+        subprocess.run(cmd_norm, check=True, capture_output=True)
+    except Exception as e:
+        print(f"[ERROR] Full audio normalization failed: {e}. Falling back to direct input.")
+        normalized_full = str(file_path)
 
-    # Chunking logic
+    # If the file is shorter than a chunk, just return normalized_full
+    if duration <= chunk_length_s:
+        return [normalized_full]
+
+    # Chunking logic from normalized WAV
     chunks = []
     start = 0
     idx = 0
@@ -128,7 +133,7 @@ def split_audio_ffmpeg(file_path, temp_dir, chunk_length_s=300, overlap_s=10):
             'ffmpeg', '-y',
             '-ss', str(start),
             '-t', str(actual_length),
-            '-i', str(file_path),
+            '-i', normalized_full,
             '-acodec', 'pcm_s16le',
             '-ar', '16000',
             '-ac', '1',
@@ -145,9 +150,31 @@ def split_audio_ffmpeg(file_path, temp_dir, chunk_length_s=300, overlap_s=10):
         
     return chunks
 
-def extract_word_timestamps(hypothesis, chunk_offset, tokenizer, frame_duration=0.04):
+def extract_word_timestamps(hypothesis, chunk_offset, tokenizer, frame_duration=0.08):
     """Extracts word-level timestamps from NeMo transcription hypothesis."""
-    if not hasattr(hypothesis, 'timestep') or not hypothesis.timestep:
+    # Check modern NeMo 2.0+ timestamp dict first
+    if hasattr(hypothesis, 'timestamp') and isinstance(hypothesis.timestamp, dict):
+        if 'word' in hypothesis.timestamp and hypothesis.timestamp['word']:
+            words = []
+            for w in hypothesis.timestamp['word']:
+                word_text = w.get('word', '').strip()
+                if not word_text:
+                    continue
+                s = chunk_offset + int(w['start_offset']) * frame_duration
+                e = chunk_offset + int(w['end_offset']) * frame_duration
+                if e <= s:
+                    e = s + frame_duration
+                words.append({
+                    'word': word_text,
+                    'start': round(s, 3),
+                    'end': round(e, 3)
+                })
+            if words:
+                return words
+
+    # Legacy NeMo timestep attribute
+    timesteps = getattr(hypothesis, 'timestep', None)
+    if not timesteps:
         return None
         
     try:
@@ -210,17 +237,51 @@ def interpolate_word_timestamps(text, start_time, end_time):
         })
     return result
 
-def group_words_into_segments(words_with_times, max_words=9):
-    """Groups words into segments suitable for a single subtitle line in SRT."""
+def group_words_into_segments(words_with_times, max_words=8, max_dur=4.5, pause_thresh=0.55):
+    """Groups words into natural subtitle segments based on pauses and max words/duration."""
+    if not words_with_times:
+        return []
+
     segments = []
-    for i in range(0, len(words_with_times), max_words):
-        chunk = words_with_times[i:i + max_words]
-        if not chunk: 
+    current_chunk = []
+    
+    for w in words_with_times:
+        if not current_chunk:
+            current_chunk.append(w)
             continue
-        text = " ".join([w['word'] for w in chunk])
-        start = chunk[0]['start']
-        end = chunk[-1]['end']
-        segments.append({"start": start, "end": end, "text": text})
+            
+        prev_w = current_chunk[-1]
+        pause = w['start'] - prev_w['end']
+        cur_dur = w['end'] - current_chunk[0]['start']
+        cur_count = len(current_chunk)
+        
+        # Split condition: significant pause (> 0.55s), or reached max words or max duration
+        if pause >= pause_thresh or cur_count >= max_words or cur_dur >= max_dur:
+            start_t = current_chunk[0]['start']
+            end_t = current_chunk[-1]['end']
+            
+            # Add small comfort padding if pause allows
+            if pause > 0.15:
+                end_t = min(end_t + 0.12, w['start'] - 0.05)
+            if end_t - start_t < 1.0 and (w['start'] - start_t >= 1.0):
+                end_t = min(start_t + 1.0, w['start'] - 0.05)
+                
+            text = " ".join([cw['word'] for cw in current_chunk]).strip()
+            if text:
+                segments.append({"start": round(start_t, 3), "end": round(end_t, 3), "text": text})
+            current_chunk = [w]
+        else:
+            current_chunk.append(w)
+            
+    if current_chunk:
+        start_t = current_chunk[0]['start']
+        end_t = current_chunk[-1]['end']
+        if end_t - start_t < 1.0:
+            end_t = start_t + 1.0
+        text = " ".join([cw['word'] for cw in current_chunk]).strip()
+        if text:
+            segments.append({"start": round(start_t, 3), "end": round(end_t, 3), "text": text})
+            
     return segments
 
 def format_timestamp(seconds):
@@ -340,12 +401,22 @@ def main():
         print("Applying Windows compatibility patches to config...")
         force_windows_safe_dataloader_cfg(model.cfg)
 
+    # Calculate frame duration dynamically
+    stride = getattr(getattr(model.cfg, 'preprocessor', None), 'window_stride', 0.01) if hasattr(model, 'cfg') else 0.01
+    subsampling = getattr(getattr(model.cfg, 'encoder', None), 'subsampling_factor', 8) if hasattr(model, 'cfg') else 8
+    frame_dur = stride * subsampling
+    print(f"Computed frame duration: {frame_dur:.4f}s (stride={stride}, subsampling={subsampling})")
+
     # Change to RNNT Greedy Decoding strategy if it's a hybrid model
     if hasattr(model, "change_decoding_strategy"):
-        print("Setting decoding strategy to rnnt_greedy...")
+        print("Setting decoding strategy to rnnt_greedy with preserve_alignments=True, compute_timestamps=True...")
         model.change_decoding_strategy(
             decoder_type="rnnt", 
-            decoding_cfg={"strategy": "greedy"}
+            decoding_cfg={
+                "strategy": "greedy",
+                "preserve_alignments": True,
+                "compute_timestamps": True
+            }
         )
 
     if hasattr(model, "to"):
@@ -369,11 +440,8 @@ def main():
         print(f"Created {len(chunks)} chunks for processing.")
 
         timestamped_segments = []
-        sig = inspect.signature(model.transcribe) if 'inspect' in sys.modules else None
-        if not sig:
-            import inspect
-            sig = inspect.signature(model.transcribe)
-            
+        all_filtered_words = []
+        sig = inspect.signature(model.transcribe)
         arg_name = "paths2audio_files" if "paths2audio_files" in sig.parameters else "audio"
 
         for i, chunk in enumerate(chunks):
@@ -403,7 +471,7 @@ def main():
                 chunk_end_shifted = chunk_start_shifted + args.chunk_len + args.overlap
                 
                 # Extract word level timestamps
-                words = extract_word_timestamps(hypothesis, chunk_start_shifted, model.tokenizer)
+                words = extract_word_timestamps(hypothesis, chunk_start_shifted, model.tokenizer, frame_duration=frame_dur)
                 
                 # Fallback to linear interpolation if timestamps are missing
                 if not words or len(words) == 0:
@@ -427,12 +495,21 @@ def main():
                             if is_last_chunk or w['start'] < official_end:
                                 filtered_words.append(w)
 
-                # Group words into segments for subtitles
+                # Collect words from chunk
                 if filtered_words:
-                    chunk_segments = group_words_into_segments(filtered_words, max_words=args.max_words)
-                    timestamped_segments.extend(chunk_segments)
+                    all_filtered_words.extend(filtered_words)
             else:
                 print(f"[WARNING] Chunk {i+1} returned no transcript.")
+
+        # Group all accumulated words across chunks into natural subtitle segments
+        if all_filtered_words:
+            all_filtered_words.sort(key=lambda x: x['start'])
+            timestamped_segments = group_words_into_segments(
+                all_filtered_words, 
+                max_words=args.max_words,
+                max_dur=4.5,
+                pause_thresh=0.55
+            )
 
         # Save to SRT file
         if timestamped_segments:

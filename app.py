@@ -187,8 +187,9 @@ def save_env_values(hf_token, tg_api_id, tg_api_hash, tg_phone):
 # =====================================================================
 from modules.ocr_common import configure_transformers_compat
 configure_transformers_compat()
-from modules.qari_ocr import initialize_unsloth_runtime
-initialize_unsloth_runtime()
+import atexit
+from modules.runtime_cleanup import cleanup_gpu_runtime
+atexit.register(cleanup_gpu_runtime)
 
 import gradio as gr
 
@@ -849,18 +850,48 @@ iframe { border: 1px solid var(--line) !important; border-radius: 12px !importan
 """
 
 def generate_higgs_ui(text, ref_audio, ref_text, temperature, top_p):
+    import threading
+    import time
     from modules.higgs_tts import generate_voice_higgs
+
     if not text or not text.strip():
-        return None, "Erreur : Le texte à synthétiser ne peut pas être vide."
-    
-    output_path, status = generate_voice_higgs(
-        text=text,
-        ref_audio_path=ref_audio,
-        ref_text=ref_text,
-        temperature=temperature,
-        top_p=top_p
-    )
-    return output_path, status
+        yield None, "Erreur : Le texte à synthétiser ne peut pas être vide."
+        return
+
+    logs = []
+    def log_cb(msg):
+        logs.append(msg)
+
+    yield None, "🚀 Initialisation de la synthèse vocale..."
+
+    result_container = {"path": None, "status": None, "done": False}
+
+    def run_gen():
+        try:
+            p, s = generate_voice_higgs(
+                text=text,
+                ref_audio_path=ref_audio,
+                ref_text=ref_text,
+                temperature=temperature,
+                top_p=top_p,
+                status_callback=log_cb
+            )
+            result_container["path"] = p
+            result_container["status"] = s
+        finally:
+            result_container["done"] = True
+
+    t = threading.Thread(target=run_gen)
+    t.start()
+
+    while not result_container["done"]:
+        time.sleep(0.4)
+        current_logs = "\n".join(logs) if logs else "⏳ Traitement en cours..."
+        yield None, current_logs
+
+    t.join()
+    final_logs = "\n".join(logs) if logs else (result_container["status"] or "Terminé")
+    yield result_container["path"], final_logs
 
 def get_pdf_iframe_html(pdf_path):
     import os
@@ -900,17 +931,13 @@ def _empty_pdf_ui(status):
         None,
         status,
         None,
-        gr.update(value="", label="Qari — PAGE —"),
+        gr.update(value="", label="Surya SFT 9750 — PAGE —"),
         gr.update(choices=[], value=None),
     ]
 
 
 def _loaded_pdf_ui(pdf_path, total_pages, third_component):
-    from modules.qari_ocr import (
-        get_cached_pdfs,
-        get_ocr_text_path as qari_path,
-        get_page_text as qari_page,
-    )
+    from modules.best_ocr import get_ocr_text_path, get_page_text
 
     batches = _build_batches(total_pages)
     pages = [str(page) for page in range(1, total_pages + 1)]
@@ -919,15 +946,19 @@ def _loaded_pdf_ui(pdf_path, total_pages, third_component):
         pdf_path,
         gr.update(choices=batches, value=batches[0] if batches else None),
         third_component,
-        qari_path(pdf_path) if os.path.exists(qari_path(pdf_path)) else None,
+        get_ocr_text_path(pdf_path) if os.path.exists(get_ocr_text_path(pdf_path)) else None,
         f"✅ {os.path.basename(pdf_path)} prêt — {total_pages} pages, images OCR à 300 DPI.",
         gr.update(
             value=get_ocr_page_image(pdf_path, first_page),
             label=f"Page PDF — PAGE {first_page}" if first_page else "Page PDF — PAGE —",
         ),
         gr.update(
-            value=qari_page(pdf_path, first_page) if first_page else "",
-            label=f"Qari — PAGE {first_page}" if first_page else "Qari — PAGE —",
+            value=get_page_text(pdf_path, first_page) if first_page else "",
+            label=(
+                f"Surya SFT 9750 — PAGE {first_page}"
+                if first_page
+                else "Surya SFT 9750 — PAGE —"
+            ),
         ),
         gr.update(choices=pages, value=pages[0] if pages else None),
     ]
@@ -971,7 +1002,7 @@ def handle_pdf_dropdown_change(cached_dropdown, progress=gr.Progress()):
     return _loaded_pdf_ui(pdf_path, total_pages, gr.update(value=None))
 
 def handle_save_full_text(pdf_path, text_content):
-    from modules.qari_ocr import get_ocr_text_path
+    from modules.best_ocr import get_ocr_text_path
     if not pdf_path:
         return "Erreur : Aucun PDF chargé."
     ocr_path = get_ocr_text_path(pdf_path)
@@ -981,37 +1012,39 @@ def handle_save_full_text(pdf_path, text_content):
     return "✅ Transcription enregistrée !"
 
 def handle_page_change(pdf_path, page_num):
-    """Synchronize the rendered PDF page with its Qari transcription."""
+    """Synchronize the PDF page with the final Surya transcription."""
     if not pdf_path or not page_num:
         return None, gr.update(value="[Non transcrit]")
-    from modules.qari_ocr import get_page_text as qari_page
+    from modules.best_ocr import get_page_text
     page = int(page_num)
     return (
         gr.update(
             value=get_ocr_page_image(pdf_path, page),
             label=f"Page PDF — PAGE {page}",
         ),
-        gr.update(value=qari_page(pdf_path, page), label=f"Qari — PAGE {page}"),
+        gr.update(
+            value=get_page_text(pdf_path, page),
+            label=f"Surya SFT 9750 — PAGE {page}",
+        ),
     )
 
 
 def handle_page_step(pdf_path, page_num, delta):
     """Move one page while keeping the image and both texts synchronized."""
     if not pdf_path:
-        image, qari_text = handle_page_change(None, None)
-        return gr.update(), image, qari_text
+        image, final_text = handle_page_change(None, None)
+        return gr.update(), image, final_text
     from modules.qari_ocr import get_pdf_total_pages
     total = get_pdf_total_pages(pdf_path)
     current = int(page_num or 1)
     target = min(max(current + int(delta), 1), max(total, 1))
-    image, qari_text = handle_page_change(pdf_path, target)
-    return str(target), image, qari_text
+    image, final_text = handle_page_change(pdf_path, target)
+    return str(target), image, final_text
 
 def run_ocr_generator(pdf_path, batch_str, model_choice, all_pdf=False, current_page=None):
 
     """
-    Streaming generator for Qari OCR.
-    Yields: (live_stream, dl_qari, status, full_qari)
+    Streaming generator for the final Surya SFT 9750 adapter.
     """
     import threading, queue as q_mod
 
@@ -1039,11 +1072,28 @@ def run_ocr_generator(pdf_path, batch_str, model_choice, all_pdf=False, current_
 
     def thread_fn():
         try:
-            import modules.qari_ocr as qari_mod
+            import modules.best_ocr as final_ocr
 
             for s, e in batches:
-                q.put(f"\n🔍 Qari 0.4.0 — pages {s}–{e}\n")
-                result = qari_mod.run_ocr_batch(pdf_path, s, e, q.put)
+                q.put(f"\n🔍 Surya SFT 9750 final — pages {s}–{e}\n")
+
+                def on_progress(event):
+                    message = (
+                        event.get("message", "")
+                        if isinstance(event, dict)
+                        else str(event)
+                    )
+                    if message:
+                        q.put(message.rstrip() + "\n")
+
+                result = final_ocr.run_ocr_batch(
+                    pdf_path,
+                    s,
+                    e,
+                    on_progress,
+                    model_variant="final",
+                    parallel_pages=8,
+                )
                 q.put(f"{result}\n")
                 if result.startswith("Échec") or result.startswith("Erreur"):
                     raise RuntimeError(result)
@@ -1068,11 +1118,11 @@ def run_ocr_generator(pdf_path, batch_str, model_choice, all_pdf=False, current_
         except q_mod.Empty:
             continue
 
-    from modules.qari_ocr import get_ocr_text_path as qari_path
-    from modules.qari_ocr import get_page_text as qari_page_text
+    from modules.best_ocr import get_ocr_text_path, get_page_text
     selected_page = int(current_page or batches[0][0])
-    page_r = qari_page_text(pdf_path, selected_page)
-    dl_r = qari_path(pdf_path) if os.path.exists(qari_path(pdf_path)) else None
+    page_r = get_page_text(pdf_path, selected_page)
+    output_path = get_ocr_text_path(pdf_path)
+    dl_r = output_path if os.path.exists(output_path) else None
     status = "✅ OCR terminé et sauvegardé page par page." if not error_box[0] else f"❌ {error_box[0]}"
     yield gr.update(visible=False), dl_r, status, page_r
 
@@ -1283,8 +1333,9 @@ with gr.Blocks(
                         )
                 with gr.Column(scale=5):
                     higgs_ref_audio = gr.Audio(
-                        label="🎙️ Audio de Référence pour le Clonage (Optionnel)",
-                        type="filepath"
+                        label="🎙️ Audio de Référence pour le Clonage (Microphone ou Fichier)",
+                        type="filepath",
+                        sources=["microphone", "upload"]
                     )
                     higgs_ref_text = gr.Textbox(
                         label="📝 Transcription de l'audio de référence (Optionnel mais recommandé)",
@@ -1303,16 +1354,15 @@ with gr.Blocks(
                 outputs=[higgs_audio_output, higgs_status_output]
             )
 
-        # --- TAB 3.7: OCR de Documents (Qari) ---
+        # --- TAB 3.7: OCR de Documents (Surya SFT final) ---
         with gr.Tab("📖 OCR arabe"):
             from modules.qari_ocr import get_cached_pdfs
 
             gr.Markdown("### Numérisation de livres et manuscrits arabes")
             gr.HTML("""
-            <div class="ocr-guide"><strong>Qari OCR 0.4.0 — moteur Unsloth, quantification 8 bits</strong>
-            privilégie la fidélité sur les livres arabes imprimés. Le modèle est chargé en 8 bits
-            pour préserver la précision des petits caractères. Son architecture contient 4 milliards de paramètres.
-            Une page 300 DPI peut prendre plusieurs minutes.</div>
+            <div class="ocr-guide"><strong>Surya OCR 2 · modèle final SFT 9750</strong>
+            s’exécute localement avec vLLM sur le GPU. Profil optimisé pour les livres arabes :
+            largeur 1920 px, jusqu’à 8 pages en parallèle et 4096 jetons par page.</div>
             """)
             active_pdf_path = gr.State()
 
@@ -1332,8 +1382,8 @@ with gr.Blocks(
                     ocr_refresh_pdfs_btn = gr.Button("🔄 Rafraîchir la liste", elem_classes=["ocr-refresh-btn"])
 
                 with gr.Column(scale=5):
-                    gr.Markdown("#### 🔍 Qari OCR 0.4.0 — 8 bits")
-                    ocr_model_choice = gr.State("Qari OCR 0.4.0")
+                    gr.Markdown("#### 🔍 Surya OCR 2 · SFT 9750 final")
+                    ocr_model_choice = gr.State("Surya SFT 9750 final")
                     ocr_batch_dropdown = gr.Dropdown(
                         choices=[],
                         value=None,
@@ -1345,7 +1395,7 @@ with gr.Blocks(
 
                 with gr.Column(scale=4):
                     ocr_status = gr.Textbox(label="📊 Statut", lines=3, interactive=False, elem_classes=["ocr-status-box"])
-                    ocr_dl_qari = gr.File(label="⬇️ Qari 0.4.0 (.txt)", interactive=False)
+                    ocr_dl_final = gr.File(label="⬇️ Surya SFT 9750 (.txt)", interactive=False)
 
             ocr_live_stream = gr.Textbox(
                 label="🚀 Flux Live (progression page par page)",
@@ -1380,24 +1430,24 @@ with gr.Blocks(
                     )
 
                 with gr.Column(scale=6, min_width=360):
-                    gr.Markdown("##### 🔍 Qari OCR 0.4.0")
-                    ocr_qari_text = gr.Textbox(
-                        label="Transcription Qari",
+                    gr.Markdown("##### 🔍 Surya SFT 9750 final")
+                    ocr_final_text = gr.Textbox(
+                        label="Transcription Surya SFT 9750",
                         lines=30, max_lines=50,
                         interactive=True,
                         elem_classes=["ocr-textbox"],
                         rtl=True
                     )
-                    save_qari_btn = gr.Button("💾 Sauvegarder Qari", variant="secondary", elem_classes=["ocr-save-page-btn"])
+                    save_final_btn = gr.Button("💾 Sauvegarder la page", variant="secondary", elem_classes=["ocr-save-page-btn"])
 
             _pdf_load_outputs = [
                 active_pdf_path,
                 ocr_batch_dropdown,
                 ocr_cached_dropdown,
-                ocr_dl_qari,
+                ocr_dl_final,
                 ocr_status,
                 ocr_pdf_viewer,
-                ocr_qari_text,
+                ocr_final_text,
                 ocr_page_selector,
             ]
 
@@ -1421,57 +1471,57 @@ with gr.Blocks(
                     active_pdf_path,
                     ocr_batch_dropdown,
                     ocr_pdf_file,
-                    ocr_dl_qari,
+                    ocr_dl_final,
                     ocr_status,
                     ocr_pdf_viewer,
-                    ocr_qari_text,
+                    ocr_final_text,
                     ocr_page_selector,
                 ]
             )
             ocr_page_load_btn.click(
                 handle_page_change,
                 inputs=[active_pdf_path, ocr_page_selector],
-                outputs=[ocr_pdf_viewer, ocr_qari_text]
+                outputs=[ocr_pdf_viewer, ocr_final_text]
             )
             ocr_page_selector.input(
                 handle_page_change,
                 inputs=[active_pdf_path, ocr_page_selector],
-                outputs=[ocr_pdf_viewer, ocr_qari_text]
+                outputs=[ocr_pdf_viewer, ocr_final_text]
             )
             ocr_page_prev_btn.click(
                 lambda pdf_path, page_num: handle_page_step(pdf_path, page_num, -1),
                 inputs=[active_pdf_path, ocr_page_selector],
-                outputs=[ocr_page_selector, ocr_pdf_viewer, ocr_qari_text],
+                outputs=[ocr_page_selector, ocr_pdf_viewer, ocr_final_text],
             )
             ocr_page_next_btn.click(
                 lambda pdf_path, page_num: handle_page_step(pdf_path, page_num, 1),
                 inputs=[active_pdf_path, ocr_page_selector],
-                outputs=[ocr_page_selector, ocr_pdf_viewer, ocr_qari_text],
+                outputs=[ocr_page_selector, ocr_pdf_viewer, ocr_final_text],
             )
 
-            def save_qari_page(pdf_path, page_num, text):
+            def save_final_page(pdf_path, page_num, text):
                 if not pdf_path or not page_num:
                     return "Erreur : PDF ou page non définis."
-                from modules.qari_ocr import load_parsed_ocr, save_parsed_ocr
+                from modules.best_ocr import load_parsed_ocr, save_parsed_ocr
                 d = load_parsed_ocr(pdf_path)
                 d[int(page_num)] = text
                 save_parsed_ocr(pdf_path, d)
-                return f"✅ Page {page_num} Qari sauvegardée."
+                return f"✅ Page {page_num} Surya SFT 9750 sauvegardée."
 
-            save_qari_btn.click(
-                save_qari_page,
-                inputs=[active_pdf_path, ocr_page_selector, ocr_qari_text],
+            save_final_btn.click(
+                save_final_page,
+                inputs=[active_pdf_path, ocr_page_selector, ocr_final_text],
                 outputs=[ocr_status]
             )
             ocr_run_batch_btn.click(
                 fn=run_ocr_generator,
                 inputs=[active_pdf_path, ocr_batch_dropdown, ocr_model_choice, gr.State(value=False), ocr_page_selector],
-                outputs=[ocr_live_stream, ocr_dl_qari, ocr_status, ocr_qari_text]
+                outputs=[ocr_live_stream, ocr_dl_final, ocr_status, ocr_final_text]
             )
             ocr_run_all_btn.click(
                 fn=run_ocr_generator,
                 inputs=[active_pdf_path, ocr_batch_dropdown, ocr_model_choice, gr.State(value=True), ocr_page_selector],
-                outputs=[ocr_live_stream, ocr_dl_qari, ocr_status, ocr_qari_text]
+                outputs=[ocr_live_stream, ocr_dl_final, ocr_status, ocr_final_text]
             )
 
 
@@ -1697,7 +1747,7 @@ if __name__ == "__main__":
         allowed_paths.append(drive.lower() + rest)
         
     demo.queue().launch(
-        server_name="0.0.0.0",
+        server_name=os.getenv("GRADIO_SERVER_NAME", "127.0.0.1"),
         server_port=server_port,
         inbrowser=os.getenv("GRADIO_INBROWSER", "0") == "1",
         allowed_paths=allowed_paths

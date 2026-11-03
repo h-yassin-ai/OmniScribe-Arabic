@@ -212,6 +212,11 @@ def split_audio_robust(file_path, chunk_length_s=600, overlap_s=10):
     Robustly splits audio using FFmpeg with PCM encoding.
     Supports overlapping segments to prevent transcription gaps.
     """
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Audio file not found: {file_path}")
+    if os.path.isdir(file_path):
+        raise IsADirectoryError(f"Target path is a directory, not a file: {file_path}")
+
     import hashlib
     import subprocess
     import glob

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import glob
+import logging
 import os
 import tempfile
 import time
@@ -116,10 +117,14 @@ def initialize_unsloth_runtime():
         return original_named_temporary_file(*args, **kwargs)
 
     tempfile.NamedTemporaryFile = named_temporary_file_without_delete_lock
+    transformers_logger = logging.getLogger("transformers")
+    previous_transformers_level = transformers_logger.level
+    transformers_logger.setLevel(logging.ERROR)
     try:
         from unsloth import FastVisionModel
     finally:
         tempfile.NamedTemporaryFile = original_named_temporary_file
+        transformers_logger.setLevel(previous_transformers_level)
 
     _fast_vision_model = FastVisionModel
     logger.info(
@@ -160,13 +165,18 @@ def clean_ocr_text(text):
     return clean_generated_text(text)
 
 
-def free_model():
+def release_qari_model():
     global _model, _processor
     model = _model
     _model = None
     _processor = None
     release_model(model)
     logger.info("[Qari OCR] Model released.")
+
+
+def free_model():
+    """Backward-compatible alias used by the existing application."""
+    release_qari_model()
 
 
 def _load_processor(AutoProcessor):
@@ -238,6 +248,15 @@ def _init_model(progress=None):
     configure_huggingface_http()
     import torch
     from transformers import AutoProcessor
+
+    # Only one vision model is kept on the 24 GB GPU at a time.
+    try:
+        from modules.best_ocr import release_best_ocr_model, stop_vllm_server
+
+        stop_vllm_server()
+        release_best_ocr_model()
+    except Exception:
+        logger.debug("[Qari OCR] Best OCR was not loaded.", exc_info=True)
 
     if progress:
         progress(0.1, desc="Chargement du processeur Qari OCR 0.4.0…")
@@ -361,7 +380,7 @@ def _run_qari_page(image_path: str, progress_cb=None) -> str:
                 self.last_report_at = now
                 return False
 
-        max_new_tokens = int(os.getenv("QARI_MAX_NEW_TOKENS", "2048"))
+        max_new_tokens = int(os.getenv("QARI_MAX_NEW_TOKENS", "4096"))
         logger.info(
             "[Qari OCR] Generation started: backend=unsloth input_tokens=%s "
             "max_new_tokens=%s precision=%s",

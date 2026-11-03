@@ -6,6 +6,9 @@ import gc
 import json
 import os
 import re
+import tempfile
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +18,8 @@ from modules.utils import logger
 OCR_PROMPT = "Free OCR"
 DEFAULT_DPI = 300
 OCR_CONTEXT_LENGTH = 262_144
+_page_map_locks: dict[str, threading.Lock] = {}
+_page_map_locks_guard = threading.Lock()
 
 
 def disable_hidden_tokenizer_truncation(processor: Any) -> Any:
@@ -188,12 +193,10 @@ def clean_generated_text(text: str) -> str:
     return "\n".join(line.strip() for line in text.splitlines() if line.strip())
 
 
-def load_page_map(path: str) -> dict[int, str]:
-    if not os.path.exists(path):
-        return {}
+def _parse_page_map_file(path: Path) -> dict[int, str]:
     pages: dict[int, str] = {}
     try:
-        content = Path(path).read_text(encoding="utf-8")
+        content = path.read_text(encoding="utf-8")
         for part in content.split("--- PAGE ")[1:]:
             header, separator, body = part.partition("\n")
             if not separator:
@@ -206,15 +209,111 @@ def load_page_map(path: str) -> dict[int, str]:
     return pages
 
 
+def load_page_map(path: str) -> dict[int, str]:
+    destination = Path(path)
+    candidates = [destination]
+    legacy_temporary = destination.with_suffix(destination.suffix + ".tmp")
+    if legacy_temporary.exists():
+        candidates.append(legacy_temporary)
+    candidates.extend(
+        candidate
+        for candidate in destination.parent.glob(f".{destination.name}.*.tmp")
+        if candidate.is_file()
+    )
+    existing = sorted(
+        {candidate.resolve() for candidate in candidates if candidate.exists()},
+        key=lambda candidate: candidate.stat().st_mtime_ns,
+    )
+    pages: dict[int, str] = {}
+    for candidate in existing:
+        pages.update(_parse_page_map_file(candidate))
+        if candidate != destination.resolve():
+            logger.warning(
+                "[OCR] Recovered pending page-map data from %s.",
+                candidate,
+            )
+    return pages
+
+
 def save_page_map(path: str, pages: dict[int, str]) -> str:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     content = "\n\n".join(
         f"--- PAGE {page} ---\n{pages[page]}" for page in sorted(pages)
     )
-    temporary = destination.with_suffix(destination.suffix + ".tmp")
-    temporary.write_text(content, encoding="utf-8")
-    os.replace(temporary, destination)
+
+    lock_key = str(destination.resolve()).casefold()
+    with _page_map_locks_guard:
+        destination_lock = _page_map_locks.setdefault(
+            lock_key,
+            threading.Lock(),
+        )
+
+    with destination_lock:
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                newline="\n",
+                delete=False,
+                dir=destination.parent,
+                prefix=f".{destination.name}.",
+                suffix=f".{os.getpid()}.{threading.get_ident()}.tmp",
+            ) as temporary:
+                temporary.write(content)
+                temporary.flush()
+                os.fsync(temporary.fileno())
+                temporary_path = Path(temporary.name)
+
+            retry_seconds = max(
+                0.0,
+                float(os.getenv("OCR_SAVE_RETRY_SECONDS", "10")),
+            )
+            deadline = time.monotonic() + retry_seconds
+            attempt = 0
+            while True:
+                try:
+                    os.replace(temporary_path, destination)
+                    temporary_path = None
+                    stale_recovery_files = [
+                        destination.with_suffix(destination.suffix + ".tmp"),
+                        *destination.parent.glob(
+                            f".{destination.name}.*.tmp"
+                        ),
+                    ]
+                    for recovery_file in stale_recovery_files:
+                        if recovery_file.exists():
+                            try:
+                                recovery_file.unlink()
+                            except OSError:
+                                logger.warning(
+                                    "[OCR] Could not remove stale recovery "
+                                    "file %s.",
+                                    recovery_file,
+                                )
+                    break
+                except PermissionError as exc:
+                    if time.monotonic() >= deadline:
+                        raise PermissionError(
+                            f"{destination} reste verrouillé après "
+                            f"{retry_seconds:.1f}s. Copie de récupération : "
+                            f"{temporary_path}"
+                        ) from exc
+                    attempt += 1
+                    delay = min(0.5, 0.05 * (2 ** min(attempt, 4)))
+                    logger.warning(
+                        "[OCR] %s is temporarily locked; retrying save in %.2fs.",
+                        destination,
+                        delay,
+                    )
+                    time.sleep(delay)
+        finally:
+            if temporary_path is not None and temporary_path.exists():
+                logger.error(
+                    "[OCR] Save failed; recovery copy preserved at %s.",
+                    temporary_path,
+                )
     return str(destination)
 
 
